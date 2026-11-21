@@ -4,22 +4,39 @@ A small local web app for downloading videos from SharePoint / OneDrive links.
 
 ## Setup (one command)
 
-Needs **Python 3.10+** (macOS's built-in 3.9 is too old: `brew install python`) and, ideally, Google Chrome.
+Needs **Python 3.10+** (macOS's built-in 3.9 is too old: `brew install python`;
+Windows: `winget install Python.Python.3.12`).
 
+macOS:
 ```bash
 git clone https://github.com/praveenks1708/share-download-app.git
 cd share-download-app
-python3 setup.py --run        # on Windows: py setup.py --run
+python3 setup.py --os macos --run
 ```
 
-`setup.py` installs everything inside this folder, and is safe to re-run:
-- a virtual environment in `.venv/`
-- the Python packages in `requirements.txt` (Flask, Playwright, yt-dlp, requests, imageio-ffmpeg)
-- the Chromium browser Playwright uses
-- ffmpeg: a bundled copy comes with `imageio-ffmpeg`; a system ffmpeg is used instead if one is installed
+Windows (PowerShell):
+```powershell
+git clone https://github.com/praveenks1708/share-download-app.git
+cd share-download-app
+py setup.py --os windows --run
+```
 
-`--run` starts the app afterwards. Later, start it with `./run.sh` (macOS/Linux) or
-`.venv\Scripts\python app.py` (Windows); it opens http://127.0.0.1:8765. Set `PORT=` to change the port.
+What `setup.py` does (safe to re-run; anything already installed is skipped):
+
+| Step | macOS (`--os macos`) | Windows (`--os windows`) |
+|---|---|---|
+| 1. ffmpeg, if missing | `brew install ffmpeg` | `winget install Gyan.FFmpeg` |
+| 1. Google Chrome, if missing | `brew install --cask google-chrome` | `winget install Google.Chrome` |
+| 2. Python packages | `.venv/` + `requirements.txt` | `.venv\` + `requirements.txt` |
+| 3. Playwright browser | `playwright install chromium` | same |
+| 4. Check ffmpeg | falls back to the copy bundled with `imageio-ffmpeg` | same |
+
+Options: `--run` starts the app afterwards · `--no-system` installs Python packages only ·
+`--no-chrome` skips Chrome · `--os` defaults to the OS it is run on, and must match it.
+If Homebrew / winget is missing, setup continues using the bundled ffmpeg and Playwright's Chromium.
+
+Start it later with `./run.sh` (macOS) or `.venv\Scripts\python app.py` (Windows); it opens
+http://127.0.0.1:8765. Set `PORT=` to change the port.
 
 ## Using it
 
