@@ -120,7 +120,11 @@
 
   <div class="jobs-head">
     <h2>Downloads</h2>
-    <button class="link" id="clear">Clear finished</button>
+    <div>
+      <button class="link" id="open-logs" title="Show logs/downloader.log for the folder above">Open logs</button>
+      <button class="link" id="clear-logs" title="Delete the logs folder's log files for the folder above">Clear logs</button>
+      <button class="link" id="clear">Clear finished</button>
+    </div>
   </div>
   <div class="card" id="jobs"><p class="empty">Nothing yet.</p></div>
 </main>
@@ -199,6 +203,16 @@ $("signin").onclick = () => {
   api("/api/signin", { url: first }).catch(e => $("err").textContent = e.message);
 };
 $("clear").onclick = () => api("/api/clear", {});
+const target = () => ({ out_dir: $("out").value, folder: $("folder").value });
+const note = (msg) => { $("err").textContent = msg; setTimeout(() => { if ($("err").textContent === msg) $("err").textContent = ""; }, 5000); };
+$("open-logs").onclick = () => api("/api/logs/open", target()).catch(e => note(e.message));
+$("clear-logs").onclick = async () => {
+  const t = target();
+  const where = t.out_dir.replace(/\/+$/, "") + (clean(t.folder) ? "/" + clean(t.folder) : "") + "/logs";
+  if (!confirm(`Delete the log files in ${where}?`)) return;
+  try { const r = await api("/api/logs/clear", t); note(`Cleared ${r.removed} log file(s).`); }
+  catch (e) { note(e.message); }
+};
 
 function clean(s) { return s.replace(/[\\/:*?"<>|\t]+/g, "_").trim().replace(/^\.+|\.+$/g, ""); }
 function updatePreview() {

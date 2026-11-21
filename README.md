@@ -55,6 +55,11 @@ through the same original-file / view-only-stream logic. Non-video files are ski
 A folder link pasted in Video mode (or a video link in Folder mode) stops with a message telling you
 to switch.
 
+**Logs:** everything is logged to `logs/downloader.log` inside the save folder (base folder + folder
+name): each link, the folder listing and order, direct-download HTTP results, every stream attempt, yt-dlp
+output and full error tracebacks. Access tokens are redacted. **Open logs** shows the file in Finder /
+Explorer, and **Clear logs** deletes it (for the folder currently entered in the form).
+
 How it works:
 1. Each link opens in a real Chrome window with its own saved profile (`.browser-profile/`).
    You sign in to Microsoft 365 there yourself the first time; the sign-in is kept for later runs.
@@ -65,6 +70,8 @@ How it works:
    - builds the `videomanifest` URL from the page's `RenderListDataAsStream` response
      (`.videoManifestUrl` template + `.driveAccessToken`), the method kylon/Sharedown uses, so it
      works even if the player never starts;
-   - otherwise grabs the `videomanifest` request the player makes.
+   - otherwise grabs the `videomanifest` request the player makes and replays it **with the player's
+     own request headers**: newer SharePoint players send the access token as an `Authorization`
+     header, so the URL alone gets HTTP 401.
 
 Only download videos you have access to and are permitted to save under your organisation's policy.

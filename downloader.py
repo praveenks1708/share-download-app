@@ -15,6 +15,7 @@ Strategy per URL:
 """
 from __future__ import annotations
 
+import logging
 import queue
 import re
 import shutil
@@ -59,8 +60,20 @@ class Job:
     created: float = field(default_factory=time.time)
 
     def update(self, **kw):
+        changed = "message" in kw and kw["message"] != self.message
+        status_changed = "status" in kw and kw["status"] != self.status
         for k, v in kw.items():
             setattr(self, k, v)
+        if status_changed or (changed and not _is_progress(self.message)):
+            lvl = logging.ERROR if self.status == "error" else logging.INFO
+            self.log(lvl, f"{self.status}: {self.message}")
+
+    def log(self, level: int, msg: str):
+        tag = self.id + (f" {self.name}" if self.name else "") + (" folder" if self.kind == "folder" else "")
+        try:
+            job_logger(self.out_dir).log(level, f"[{tag}] {_redact(str(msg))}")
+        except Exception:  # noqa: BLE001 - logging must never break a download
+            pass
 
 
 class Downloader:
@@ -88,6 +101,8 @@ class Downloader:
                 self.jobs[job.id] = job
                 self.order.append(job.id)
         for job in jobs:
+            job.log(logging.INFO, f"queued {mode} link: {job.url} -> {out_dir} "
+                                  f"(prefix={prefix!r}, sort={sort}, subfolders={recursive})")
             self._q.put(("job", job))
         return jobs
 
@@ -115,6 +130,16 @@ class Downloader:
     def list(self):
         return [asdict(self.jobs[i]) for i in self.order]  # download order
 
+    def clear_logs(self, out_dir: str) -> int:
+        """Delete <out_dir>/logs/*.log. Returns how many files were removed."""
+        close_logger(out_dir)
+        d = Path(out_dir).expanduser() / "logs"
+        n = 0
+        for f in d.glob("*.log*"):
+            f.unlink(missing_ok=True)
+            n += 1
+        return n
+
     def clear_finished(self):
         self.order = [i for i in self.order if self.jobs[i].status not in ("done", "error")]
 
@@ -132,6 +157,7 @@ class Downloader:
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
                 if kind == "job":
+                    arg.log(logging.ERROR, "failed:\n" + traceback.format_exc())
                     arg.update(status="error", message=_short(e))
 
     def _context(self):
@@ -166,9 +192,9 @@ class Downloader:
         ctx = self._context()
         page = ctx.new_page()
         children: list[Job] | None = None
-        manifests: list[str] = []
+        manifests: list = []  # Playwright requests the player made for videomanifest
         list_data: list = []  # responses carrying ListSchema[".videoManifestUrl"]
-        page.on("request", lambda r: manifests.append(r.url) if "videomanifest" in r.url else None)
+        page.on("request", lambda r: manifests.append(r) if "videomanifest" in r.url else None)
 
         def on_response(resp):
             if any(k in resp.url for k in LIST_DATA_CALLS):
@@ -184,6 +210,7 @@ class Downloader:
                 site = _site_of(unquote(parsed.path))
                 target = (f"{parsed.scheme}://{parsed.netloc}{site}/_layouts/15/stream.aspx"
                           f"?id={quote(unquote(parsed.path))}")
+            job.log(logging.INFO, f"opening {target}")
             page.goto(target, wait_until="domcontentloaded", timeout=60_000)
 
             # Wait until we are on SharePoint (past any login) and know the file/folder path.
@@ -208,6 +235,8 @@ class Downloader:
 
             pr = urlparse(page.url)
             origin = f"{pr.scheme}://{pr.netloc}"
+            job.log(logging.INFO, f"page: {page.url} | file={file_path} folder={folder_path} "
+                                  f"manifests_seen={len(manifests)}")
 
             # Folder mode: list its videos, then download them one by one (below).
             if job.kind == "folder":
@@ -240,14 +269,19 @@ class Downloader:
                 raise RuntimeError("Could not download the file and no video stream was found. "
                                    "Check you can play this video in the browser window.")
             errors = []
-            for m in candidates:
+            for i, (m, headers, label) in enumerate(candidates, 1):
+                job.log(logging.INFO, f"stream attempt {i}/{len(candidates)} ({label}): {m} "
+                                      f"headers={sorted(headers)}")
                 try:
-                    self._stream(job, m, dest)
+                    self._stream(job, m, headers, dest)
                     return
                 except Exception as e:  # noqa: BLE001
+                    job.log(logging.WARNING, f"stream attempt {i} failed: {_clean(e)}")
                     errors.append(_short(e))
                     job.update(message="Stream attempt failed, trying another…", progress=-1)
-            raise RuntimeError("Stream download failed: " + errors[-1])
+            raise RuntimeError("Stream download failed: " + errors[-1]
+                               + (" — the video service refused access (401/403); see logs"
+                                  if any(c in errors[-1] for c in ("401", "403")) else ""))
         finally:
             try:
                 page.close()
@@ -268,6 +302,9 @@ class Downloader:
             field_ = "created" if job.sort == "created" else "modified"
             videos.sort(key=lambda f: (_when(f.get(field_)), _natural(f["path"])),
                         reverse=job.sort.endswith("_desc"))
+        job.log(logging.INFO, f"listed {len(files)} files, {len(videos)} videos, order={job.sort}:\n"
+                + "\n".join(f"  {i:>3}. {f.get('modified') or ''}  {f['path']}"
+                            for i, f in enumerate(videos, 1)))
         if not videos:
             raise RuntimeError(f"No videos found in this folder ({len(files)} other files)."
                                + ("" if job.recursive else " Tick 'Include subfolders' to look deeper."))
@@ -294,6 +331,7 @@ class Downloader:
                 self._run(c)
             except Exception as e:  # noqa: BLE001
                 traceback.print_exc()
+                c.log(logging.ERROR, "failed:\n" + traceback.format_exc())
                 c.update(status="error", message=_short(e))
             if c.status == "done":
                 ok += 1
@@ -303,12 +341,15 @@ class Downloader:
                    message=f"{len(children)} videos: {ok} downloaded"
                            + (f", {failed} failed" if failed else ""))
 
-    def _manifest_candidates(self, page, file_path, manifests, list_data) -> list[str]:
+    def _manifest_candidates(self, page, file_path, manifests, list_data) -> list[tuple]:
         """Manifest URLs to try, best first.
 
         a) Built from the list-data response's `.videoManifestUrl` template (the
            approach Sharedown uses) - works even if the player never starts.
-        b) The manifest the player actually requested, sniffed from the network.
+        b) The manifest the player actually requested, sniffed from the network,
+           replayed with the player's own request headers (newer players send the
+           access token as an Authorization header, not in the URL).
+        Returns [(url, headers, label)].
         """
         def built():
             out = []
@@ -334,13 +375,20 @@ class Downloader:
                 if out or manifests:
                     break
                 _nudge_play(page)
-        for m in reversed(manifests):
-            out += [_normalize_manifest(m), _clean_manifest(m)]
+        cands = [(u, {}, "built from list data") for u in out]
+        for r in reversed(manifests):
+            try:
+                hdrs = _replay_headers(r.all_headers())
+            except Exception:  # noqa: BLE001
+                hdrs = _replay_headers(r.headers)
+            cands += [(r.url, hdrs, "player request as-is"),
+                      (_normalize_manifest(r.url), hdrs, "player request, normalized"),
+                      (_clean_manifest(r.url), hdrs, "player request, trimmed")]
         seen, uniq = set(), []
-        for u in out:
-            if u not in seen:
-                seen.add(u)
-                uniq.append(u)
+        for c in cands:
+            if c[0] not in seen:
+                seen.add(c[0])
+                uniq.append(c)
         return uniq
 
     def _direct(self, job: Job, ctx, origin: str, file_path: str, dest: Path) -> bool:
@@ -350,13 +398,18 @@ class Downloader:
         for c in ctx.cookies([origin]):
             s.cookies.set(c["name"], c["value"], domain=c["domain"], path=c.get("path", "/"))
         s.headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+        job.log(logging.INFO, f"direct download: GET {url} ({len(s.cookies)} cookies)")
         try:
             r = s.get(url, stream=True, timeout=60, allow_redirects=True)
-        except requests.RequestException:
+        except requests.RequestException as e:
+            job.log(logging.WARNING, f"direct download error: {e}")
             return False
         ctype = r.headers.get("content-type", "")
+        job.log(logging.INFO, f"direct download: HTTP {r.status_code} {ctype} "
+                              f"length={r.headers.get('content-length')} final_url={r.url}")
         if r.status_code != 200 or "text/html" in ctype or "json" in ctype:
             r.close()
+            job.log(logging.INFO, "direct download not allowed; falling back to the stream")
             return False
         total = int(r.headers.get("content-length") or 0)
         done = 0
@@ -371,9 +424,10 @@ class Downloader:
                                    + (f" / {_mb(total)}" if total else ""))
         tmp.rename(dest)
         job.update(status="done", progress=1.0, path=str(dest), message=f"Saved {_mb(done)}")
+        job.log(logging.INFO, f"saved {dest}")
         return True
 
-    def _stream(self, job: Job, manifest: str, dest: Path):
+    def _stream(self, job: Job, manifest: str, headers: dict, dest: Path):
         import yt_dlp
 
         job.update(method="video stream (DASH)")
@@ -399,6 +453,9 @@ class Downloader:
             "quiet": True,
             "noprogress": True,
             "concurrent_fragment_downloads": 4,
+            "http_headers": headers or {},
+            "logger": _YtdlpLog(job),
+            "no_color": True,
         }
         ff = ffmpeg_path()
         if ff:
@@ -411,6 +468,87 @@ class Downloader:
             final = cands[-1] if cands else final
         job.update(status="done", progress=1.0, path=str(final), filename=final.name,
                    message=f"Saved {_mb(final.stat().st_size) if final.exists() else ''}")
+        job.log(logging.INFO, f"saved {final}")
+
+
+# ---------- logging ----------
+_LOGGERS: dict[str, logging.Logger] = {}
+_LOG_LOCK = threading.Lock()
+
+
+def job_logger(out_dir: str) -> logging.Logger:
+    """Logger writing to <out_dir>/logs/downloader.log (one per save folder)."""
+    key = str(Path(out_dir).expanduser())
+    with _LOG_LOCK:
+        lg = _LOGGERS.get(key)
+        if lg is None:
+            d = Path(key) / "logs"
+            d.mkdir(parents=True, exist_ok=True)
+            lg = logging.getLogger("spdl." + uuid.uuid4().hex)
+            lg.setLevel(logging.DEBUG)
+            lg.propagate = False
+            h = logging.FileHandler(d / "downloader.log", encoding="utf-8")
+            h.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+            lg.addHandler(h)
+            _LOGGERS[key] = lg
+        return lg
+
+
+def close_logger(out_dir: str):
+    key = str(Path(out_dir).expanduser())
+    with _LOG_LOCK:
+        lg = _LOGGERS.pop(key, None)
+    if lg:
+        for h in list(lg.handlers):
+            h.close()
+            lg.removeHandler(h)
+
+
+class _YtdlpLog:
+    """Routes yt-dlp's own messages into the job's log file."""
+
+    def __init__(self, job: Job):
+        self.job = job
+
+    def debug(self, msg):
+        if not msg.startswith("[download]") or "Destination" in msg:
+            self.job.log(logging.DEBUG, "yt-dlp: " + _clean(msg))
+
+    def info(self, msg):
+        self.debug(msg)
+
+    def warning(self, msg):
+        self.job.log(logging.WARNING, "yt-dlp: " + _clean(msg))
+
+    def error(self, msg):
+        self.job.log(logging.ERROR, "yt-dlp: " + _clean(msg))
+
+
+_SECRET_RE = re.compile(r"(?<![A-Za-z_])((?:access_token|tempauth|token|sig|signature|code)=)[^&\s'\"]+", re.I)
+
+
+def _redact(s: str) -> str:
+    s = _SECRET_RE.sub(r"\1<redacted>", s)
+    return re.sub(r"(Bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1<redacted>", s)
+
+
+def _is_progress(msg: str) -> bool:
+    return msg.startswith("Downloading ") and " MB" in msg
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _clean(e) -> str:
+    return _ANSI.sub("", str(e)).strip()
+
+
+def _replay_headers(h: dict) -> dict:
+    """Headers from the player's request that are safe to send again."""
+    # Conditional/cache headers would make the server answer 304 Not Modified.
+    drop = {"host", "content-length", "accept-encoding", "connection", "range",
+            "if-modified-since", "if-none-match", "if-match", "if-unmodified-since", "if-range"}
+    return {k: v for k, v in (h or {}).items() if not k.startswith(":") and k.lower() not in drop}
 
 
 # ---------- helpers ----------
@@ -646,5 +784,6 @@ def _mb(n: int) -> str:
 
 
 def _short(e: Exception) -> str:
-    s = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
-    return s[:300]
+    s = _clean(e)
+    s = s.splitlines()[0] if s else type(e).__name__
+    return _redact(s)[:300]
