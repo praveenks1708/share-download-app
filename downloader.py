@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import queue
 import re
+import shutil
 import threading
 import time
 import traceback
@@ -326,6 +327,9 @@ class Downloader:
             "noprogress": True,
             "concurrent_fragment_downloads": 4,
         }
+        ff = ffmpeg_path()
+        if ff:
+            opts["ffmpeg_location"] = ff
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([manifest])
         final = dest.with_suffix(".mp4")
@@ -337,6 +341,20 @@ class Downloader:
 
 
 # ---------- helpers ----------
+def ffmpeg_path() -> str | None:
+    """System ffmpeg if installed, else the copy bundled with imageio-ffmpeg."""
+    sys_ff = shutil.which("ffmpeg")
+    if sys_ff:
+        return sys_ff
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+
 def _file_path_from(url: str) -> str | None:
     """Server-relative path of the file from a stream.aspx / AllItems.aspx / direct URL."""
     p = urlparse(url)
