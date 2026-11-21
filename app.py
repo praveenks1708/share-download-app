@@ -5,6 +5,7 @@ Run:  ./run.sh   (or: .venv/bin/python app.py)   then open http://127.0.0.1:8765
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -36,13 +37,23 @@ def jobs():
 @app.post("/api/download")
 def download():
     data = request.get_json(force=True)
-    out_dir = (data.get("out_dir") or DEFAULT_OUT).strip()
+    base = (data.get("out_dir") or DEFAULT_OUT).strip()
+    folder = _clean_name(data.get("folder"))
+    prefix = _clean_name(data.get("prefix")).rstrip("_")
     urls = [u.strip() for u in (data.get("urls") or "").splitlines() if u.strip()]
     bad = [u for u in urls if not u.lower().startswith("https://")]
     if not urls or bad:
         return jsonify(error="Paste one or more https:// SharePoint links, one per line."), 400
-    created = [dl.submit(u, out_dir).id for u in urls]
-    return jsonify(ok=True, ids=created)
+    out_dir = str(Path(base).expanduser() / folder) if folder else base
+    jobs = dl.submit_batch(urls, out_dir, prefix)
+    return jsonify(ok=True, ids=[j.id for j in jobs], out_dir=out_dir,
+                   names=[j.filename for j in jobs])
+
+
+def _clean_name(s) -> str:
+    """A single safe path component: no slashes, no leading dots."""
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(s or "")).strip(" .")
+    return s[:100]
 
 
 @app.post("/api/signin")

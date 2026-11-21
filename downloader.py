@@ -41,6 +41,7 @@ LIST_DATA_CALLS = ("RenderListDataAsStream", "GetListDataAsStream")
 class Job:
     url: str
     out_dir: str
+    name: str = ""  # target file name without extension, e.g. "class_3"
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     status: str = "queued"  # queued | running | waiting_login | done | error
     message: str = "Waiting in queue"
@@ -60,18 +61,40 @@ class Downloader:
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
         self._q: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
         self._pw = None
         self._ctx = None
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     # ---------- public API (any thread) ----------
-    def submit(self, url: str, out_dir: str) -> Job:
-        job = Job(url=url.strip(), out_dir=out_dir)
-        self.jobs[job.id] = job
-        self.order.append(job.id)
-        self._q.put(("job", job))
-        return job
+    def submit_batch(self, urls: list[str], out_dir: str, prefix: str = "") -> list[Job]:
+        """Queue URLs, naming them <prefix>_N (or N) in order, continuing after
+        the highest number already used in that folder."""
+        with self._lock:
+            n = self._next_number(out_dir, prefix)
+            jobs = []
+            for i, url in enumerate(urls):
+                name = f"{prefix}_{n + i}" if prefix else str(n + i)
+                job = Job(url=url.strip(), out_dir=out_dir, name=name, filename=name + ".mp4")
+                self.jobs[job.id] = job
+                self.order.append(job.id)
+                jobs.append(job)
+        for job in jobs:
+            self._q.put(("job", job))
+        return jobs
+
+    def _next_number(self, out_dir: str, prefix: str) -> int:
+        pat = re.compile(rf"^{re.escape(prefix + '_') if prefix else ''}(\d+)(\.[^.]+)*$", re.I)
+        used = []
+        d = Path(out_dir).expanduser()
+        if d.is_dir():
+            used += [int(m.group(1)) for f in d.iterdir() if (m := pat.match(f.name))]
+        # numbers reserved by jobs still queued or running for the same folder
+        used += [int(m.group(1)) for j in self.jobs.values()
+                 if j.out_dir == out_dir and j.status not in ("done", "error")
+                 and (m := pat.match(j.name))]
+        return max(used, default=0) + 1
 
     def open_signin(self, url: str | None):
         self._q.put(("signin", url or "https://www.office.com/"))
@@ -170,7 +193,11 @@ class Downloader:
 
             pr = urlparse(page.url)
             origin = f"{pr.scheme}://{pr.netloc}"
-            name = Path(file_path).name if file_path else _safe(page.title() or "video") + ".mp4"
+            if job.name:
+                ext = Path(file_path).suffix.lower() if file_path else ""
+                name = job.name + (ext if ext in VIDEO_EXT else ".mp4")
+            else:
+                name = Path(file_path).name if file_path else _safe(page.title() or "video") + ".mp4"
             dest = _unique(out_dir / _safe(name))
             job.update(filename=dest.name)
 

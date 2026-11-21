@@ -55,6 +55,11 @@
   @keyframes slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
   .msg { font-size: 13px; color: var(--muted); margin-top: 6px; }
   .empty { color: var(--muted); font-size: 14px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  .opt { font-weight: 400; color: var(--muted); }
+  .preview { font-size: 13px; color: var(--muted); margin: 12px 0 0; overflow-wrap: anywhere; }
+  .preview b { color: var(--text); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -66,9 +71,20 @@
     <label for="urls">Video links (one per line)</label>
     <textarea id="urls" placeholder="https://contoso.sharepoint.com/:v:/s/Team/EaBc...&#10;https://contoso.sharepoint.com/sites/Team/_layouts/15/stream.aspx?id=..."></textarea>
     <div class="row">
-      <label for="out">Save to folder</label>
+      <label for="out">Base folder</label>
       <input type="text" id="out">
     </div>
+    <div class="grid">
+      <div class="row">
+        <label for="folder">Folder name <span class="opt">(optional, created inside base folder)</span></label>
+        <input type="text" id="folder" placeholder="e.g. Physics Week 3">
+      </div>
+      <div class="row">
+        <label for="prefix">File name prefix <span class="opt">(optional)</span></label>
+        <input type="text" id="prefix" placeholder="e.g. class">
+      </div>
+    </div>
+    <p class="preview" id="preview"></p>
     <div class="actions">
       <button class="primary" id="go">Download</button>
       <button id="signin" title="Open the browser window to sign in to Microsoft 365 before downloading">Sign in first</button>
@@ -128,6 +144,7 @@ async function poll() {
       let saved = null;
       try { saved = localStorage.getItem("sp-out"); } catch {}
       $("out").value = saved || d.default_out; outSet = true;
+      updatePreview();
     }
     render(d.jobs);
   } catch {}
@@ -139,8 +156,12 @@ $("go").onclick = async () => {
   $("go").disabled = true;
   try {
     try { localStorage.setItem("sp-out", $("out").value); } catch {}
-    await api("/api/download", { urls: $("urls").value, out_dir: $("out").value });
+    await api("/api/download", {
+      urls: $("urls").value, out_dir: $("out").value,
+      folder: $("folder").value, prefix: $("prefix").value
+    });
     $("urls").value = "";
+    updatePreview();
   } catch (e) { $("err").textContent = e.message; }
   finally { $("go").disabled = false; }
 };
@@ -149,6 +170,19 @@ $("signin").onclick = () => {
   api("/api/signin", { url: first }).catch(e => $("err").textContent = e.message);
 };
 $("clear").onclick = () => api("/api/clear", {});
+
+function clean(s) { return s.replace(/[\\/:*?"<>|\t]+/g, "_").trim().replace(/^\.+|\.+$/g, ""); }
+function updatePreview() {
+  const base = $("out").value.trim().replace(/\/+$/, "");
+  const folder = clean($("folder").value);
+  const prefix = clean($("prefix").value).replace(/_+$/, "");
+  const n = $("urls").value.split("\n").filter(s => s.trim()).length || 1;
+  const name = (i) => (prefix ? prefix + "_" : "") + i + ".mp4";
+  const names = n === 1 ? name(1) : n === 2 ? `${name(1)}, ${name(2)}` : `${name(1)}, ${name(2)} … ${name(n)}`;
+  $("preview").innerHTML = `Saves to <b>${esc(base + (folder ? "/" + folder : ""))}</b> as <b>${esc(names)}</b>` +
+    ` <span>(numbering continues after files already in that folder)</span>`;
+}
+["out", "folder", "prefix", "urls"].forEach(id => $(id).addEventListener("input", updatePreview));
 $("jobs").addEventListener("click", (e) => {
   const p = e.target.dataset && e.target.dataset.path;
   if (p) api("/api/reveal", { path: p }).catch(err => $("err").textContent = err.message);
