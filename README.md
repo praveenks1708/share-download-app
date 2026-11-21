@@ -40,14 +40,20 @@ http://127.0.0.1:8765. Set `PORT=` to change the port.
 
 ## Using it
 
-Paste **video links or folder links**, one per line. Optionally set a **Folder name** (created inside the
-base folder) and a **File name prefix**. Videos are saved as `<prefix>_1.mp4`, `<prefix>_2.mp4`, … (or
-`1.mp4`, `2.mp4`, …) in download order, continuing after the highest number already in that folder.
+Pick the link type with the two buttons at the top, **Video links** or **Folder link**, then paste links
+one per line. Optionally set a **Folder name** (created inside the base folder) and a **File name prefix**.
+Videos are saved as `<prefix>_1.mp4`, `<prefix>_2.mp4`, … (or `1.mp4`, `2.mp4`, …) in download order,
+continuing after the highest number already in that folder.
 
-**Folder links** (a `/:f:/` sharing link, or a library / OneDrive folder URL with `?id=/sites/.../Folder`):
-the app lists every video in the folder and downloads them one by one, each through the same
-original-file / view-only-stream logic. Options: **Include subfolders**, and **Order** by name
-(natural: 1, 2, 10), date created or date modified. Non-video files are skipped.
+**Folder link** mode (a `/:f:/` sharing link, or a library / OneDrive folder URL): the app lists every
+video in the folder, however many there are (listings are paged), and downloads them one by one, each
+through the same original-file / view-only-stream logic. Non-video files are skipped.
+- **Download order:** date modified oldest first (default), date modified newest first,
+  date created, or name (natural: 1, 2, 10).
+- **Include subfolders** to go deeper.
+
+A folder link pasted in Video mode (or a video link in Folder mode) stops with a message telling you
+to switch.
 
 How it works:
 1. Each link opens in a real Chrome window with its own saved profile (`.browser-profile/`).

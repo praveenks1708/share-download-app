@@ -59,7 +59,9 @@
   @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
   .opt { font-weight: 400; color: var(--muted); }
   .folder-opts { display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: center; margin-top: 14px; font-size: 14px; }
-  .opt-title { font-weight: 600; font-size: 13px; }
+  .modes { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+  .mode.active { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+  .folder-opts[hidden] { display: none; }
   label.inline { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; font-size: 14px; margin: 0; }
   select { font: inherit; font-size: 14px; background: var(--bg); color: var(--text);
            border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px; }
@@ -75,7 +77,11 @@
   <p class="sub">Paste SharePoint or OneDrive video links. A browser window opens using your own sign-in.</p>
 
   <div class="card">
-    <label for="urls">Video or folder links (one per line)</label>
+    <div class="modes" role="group" aria-label="Link type">
+      <button type="button" class="mode" data-mode="video">Video links</button>
+      <button type="button" class="mode" data-mode="folder">Folder link</button>
+    </div>
+    <label for="urls" id="urls-label">Video links (one per line)</label>
     <textarea id="urls" placeholder="https://contoso.sharepoint.com/:v:/s/Team/EaBc...&#10;https://contoso.sharepoint.com/sites/Team/_layouts/15/stream.aspx?id=..."></textarea>
     <div class="row">
       <label for="out">Base folder</label>
@@ -91,16 +97,16 @@
         <input type="text" id="prefix" placeholder="e.g. class">
       </div>
     </div>
-    <div class="folder-opts">
-      <span class="opt-title">For folder links:</span>
-      <label class="inline"><input type="checkbox" id="recursive"> Include subfolders</label>
-      <label class="inline">Order
+    <div class="folder-opts" id="folder-opts">
+      <label class="inline">Download order
         <select id="sort">
-          <option value="name">by name (1, 2, 10)</option>
-          <option value="created">by date created</option>
-          <option value="modified">by date modified</option>
+          <option value="modified">Date modified, oldest first</option>
+          <option value="modified_desc">Date modified, newest first</option>
+          <option value="created">Date created, oldest first</option>
+          <option value="name">Name (1, 2, 10 …)</option>
         </select>
       </label>
+      <label class="inline"><input type="checkbox" id="recursive"> Include subfolders</label>
     </div>
     <p class="preview" id="preview"></p>
     <div class="actions">
@@ -180,7 +186,7 @@ $("go").onclick = async () => {
     try { localStorage.setItem("sp-out", $("out").value); } catch {}
     await api("/api/download", {
       urls: $("urls").value, out_dir: $("out").value,
-      folder: $("folder").value, prefix: $("prefix").value,
+      folder: $("folder").value, prefix: $("prefix").value, mode,
       recursive: $("recursive").checked, sort: $("sort").value
     });
     $("urls").value = "";
@@ -204,6 +210,30 @@ function updatePreview() {
     ` <span>in download order (folder videos included), continuing after files already in that folder</span>`;
 }
 ["out", "folder", "prefix", "urls"].forEach(id => $(id).addEventListener("input", updatePreview));
+
+// Link type: two buttons, the active one filled like "Download".
+let mode = "video";
+const PLACEHOLDER = {
+  video: "https://contoso.sharepoint.com/:v:/s/Team/EaBc...\nhttps://contoso.sharepoint.com/sites/Team/_layouts/15/stream.aspx?id=...",
+  folder: "https://contoso.sharepoint.com/:f:/s/Team/EkXy...\nhttps://contoso.sharepoint.com/sites/Team/Shared%20Documents/Forms/AllItems.aspx?id=...",
+};
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll(".mode").forEach(b => {
+    b.classList.toggle("active", b.dataset.mode === m);
+    b.setAttribute("aria-pressed", b.dataset.mode === m);
+  });
+  $("urls-label").textContent = m === "folder"
+    ? "Folder links (one per line); every video inside is downloaded"
+    : "Video links (one per line)";
+  $("urls").placeholder = PLACEHOLDER[m];
+  $("folder-opts").hidden = m !== "folder";
+  try { localStorage.setItem("sp-mode", m); } catch {}
+}
+document.querySelectorAll(".mode").forEach(b => b.onclick = () => setMode(b.dataset.mode));
+let savedMode = null;
+try { savedMode = localStorage.getItem("sp-mode"); } catch {}
+setMode(savedMode === "folder" ? "folder" : "video");
 $("jobs").addEventListener("click", (e) => {
   const p = e.target.dataset && e.target.dataset.path;
   if (p) api("/api/reveal", { path: p }).catch(err => $("err").textContent = err.message);

@@ -44,11 +44,11 @@ class Job:
     out_dir: str
     prefix: str = ""  # file names become <prefix>_N (or N)
     name: str = ""  # assigned when the download starts, e.g. "class_3"
-    kind: str = "video"  # video | folder
+    kind: str = "video"  # video | folder (chosen in the UI, not detected)
     parent: str = ""  # folder job this video came from
     source: str = ""  # original file name on SharePoint
     recursive: bool = False  # folder links: include subfolders
-    sort: str = "name"  # folder links: name | created | modified
+    sort: str = "modified"  # folder links: modified | modified_desc | created | name
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     status: str = "queued"  # queued | running | waiting_login | done | error
     message: str = "Waiting in queue"
@@ -76,12 +76,13 @@ class Downloader:
 
     # ---------- public API (any thread) ----------
     def submit_batch(self, urls: list[str], out_dir: str, prefix: str = "",
-                     recursive: bool = False, sort: str = "name") -> list[Job]:
-        """Queue video or folder links. Files are named <prefix>_N (or N) when
-        each download starts, continuing after the highest number in that folder,
-        so numbers follow download order (folder contents included)."""
-        jobs = [Job(url=u.strip(), out_dir=out_dir, prefix=prefix, recursive=recursive, sort=sort)
-                for u in urls]
+                     recursive: bool = False, sort: str = "modified",
+                     mode: str = "video") -> list[Job]:
+        """Queue links as videos (mode="video") or folders (mode="folder").
+        Files are named <prefix>_N (or N) when each download starts, continuing
+        after the highest number in that folder, so numbers follow download order."""
+        jobs = [Job(url=u.strip(), out_dir=out_dir, prefix=prefix, recursive=recursive, sort=sort,
+                    kind=mode) for u in urls]
         with self._lock:
             for job in jobs:
                 self.jobs[job.id] = job
@@ -208,12 +209,17 @@ class Downloader:
             pr = urlparse(page.url)
             origin = f"{pr.scheme}://{pr.netloc}"
 
-            # Folder link: list its videos, then download them one by one (below).
-            if folder_path and not manifests:
+            # Folder mode: list its videos, then download them one by one (below).
+            if job.kind == "folder":
+                if not folder_path:
+                    raise RuntimeError("This is not a folder link. Switch to 'Video links' for it.")
                 children = self._expand_folder(job, page, origin, folder_path)
                 return
+            if folder_path and not manifests:
+                raise RuntimeError("This is a folder link. Switch to 'Folder link' to download "
+                                   "every video in it.")
             if not file_path and not manifests:
-                raise RuntimeError("This link is not a video or a folder.")
+                raise RuntimeError("Could not find a video at this link.")
 
             ext = Path(file_path).suffix.lower() if file_path else ""
             name = self._assign_name(job) + (ext if ext in VIDEO_EXT else ".mp4")
@@ -256,11 +262,12 @@ class Downloader:
                    message="Listing videos in folder…")
         files = _list_folder(page, folder_path, job.recursive)
         videos = [f for f in files if f["path"].lower().endswith(VIDEO_EXT)]
-        key = {
-            "created": lambda f: (f.get("created") or "", _natural(f["path"])),
-            "modified": lambda f: (f.get("modified") or "", _natural(f["path"])),
-        }.get(job.sort, lambda f: _natural(f["path"]))
-        videos.sort(key=key)
+        if job.sort == "name":
+            videos.sort(key=lambda f: _natural(f["path"]))
+        else:
+            field_ = "created" if job.sort == "created" else "modified"
+            videos.sort(key=lambda f: (_when(f.get(field_)), _natural(f["path"])),
+                        reverse=job.sort.endswith("_desc"))
         if not videos:
             raise RuntimeError(f"No videos found in this folder ({len(files)} other files)."
                                + ("" if job.recursive else " Tick 'Include subfolders' to look deeper."))
@@ -455,31 +462,48 @@ async ({site, folder, recursive, listUrl}) => {
   const H = {Accept: 'application/json;odata=nometadata'};
   const q = s => encodeURIComponent(s.replace(/'/g, "''"));
   const api = location.origin + site + '/_api/web';
+  // GET every page of an OData collection (follows odata.nextLink).
+  async function all(url) {
+    let out = [];
+    while (url) {
+      const r = await fetch(url, {headers: H});
+      if (!r.ok) throw new Error('REST ' + r.status);
+      const j = await r.json();
+      out = out.concat(j.value || []);
+      url = j['odata.nextLink'] || j['@odata.nextLink'] || null;
+    }
+    return out;
+  }
   async function rest(path) {
     const base = `${api}/GetFolderByServerRelativePath(decodedurl='${q(path)}')`;
-    const r = await fetch(`${base}/Files?$select=ServerRelativeUrl,TimeCreated,TimeLastModified&$top=5000`, {headers: H});
-    if (!r.ok) throw new Error('REST ' + r.status);
-    let out = (await r.json()).value.map(f => ({path: f.ServerRelativeUrl, created: f.TimeCreated, modified: f.TimeLastModified}));
-    if (recursive) {
-      const d = await fetch(`${base}/Folders?$select=Name,ServerRelativeUrl&$top=5000`, {headers: H});
-      if (d.ok) for (const sub of (await d.json()).value)
+    let out = (await all(`${base}/Files?$select=ServerRelativeUrl,TimeCreated,TimeLastModified&$top=5000`))
+      .map(f => ({path: f.ServerRelativeUrl, created: f.TimeCreated, modified: f.TimeLastModified}));
+    if (recursive)
+      for (const sub of await all(`${base}/Folders?$select=Name,ServerRelativeUrl&$top=5000`))
         if (sub.Name !== 'Forms') out = out.concat(await rest(sub.ServerRelativeUrl));
-    }
     return out;
   }
   try { return {files: await rest(folder)}; } catch (e) { var restErr = String(e); }
   // Fallback: the call the SharePoint UI itself uses (works for some sharing-link access).
   const digest = (window._spPageContextInfo || {}).formDigestValue
               || (document.getElementById('__REQUESTDIGEST') || {}).value || '';
-  const u = `${api}/GetList(@a1)/RenderListDataAsStream?@a1='${q(listUrl)}'&RootFolder=${encodeURIComponent(folder)}`;
+  const base = `${api}/GetList(@a1)/RenderListDataAsStream?@a1='${q(listUrl)}'&RootFolder=${encodeURIComponent(folder)}`;
   const view = `<View${recursive ? ' Scope="RecursiveAll"' : ''}><ViewFields><FieldRef Name="FileRef"/>`
              + `<FieldRef Name="FSObjType"/><FieldRef Name="Created"/><FieldRef Name="Modified"/></ViewFields>`
-             + `<RowLimit Paged="TRUE">5000</RowLimit></View>`;
-  const r = await fetch(u, {method: 'POST', body: JSON.stringify({parameters: {RenderOptions: 2, ViewXml: view}}),
-    headers: {...H, 'Content-Type': 'application/json;odata=nometadata', ...(digest ? {'X-RequestDigest': digest} : {})}});
-  if (!r.ok) return {error: `${restErr}; list ${r.status}`};
-  const j = await r.json();
-  return {files: (j.Row || []).filter(x => String(x.FSObjType) === '0')
+             + `<RowLimit Paged="TRUE">500</RowLimit></View>`;
+  const headers = {...H, 'Content-Type': 'application/json;odata=nometadata',
+                   ...(digest ? {'X-RequestDigest': digest} : {})};
+  let rows = [], next = '';
+  for (let page = 0; page < 200; page++) {   // follow NextHref paging
+    const r = await fetch(base + (next ? '&' + next.replace(/^\?/, '') : ''), {method: 'POST', headers,
+      body: JSON.stringify({parameters: {RenderOptions: 2, ViewXml: view}})});
+    if (!r.ok) return {error: `${restErr}; list ${r.status}`};
+    const j = await r.json();
+    rows = rows.concat(j.Row || []);
+    next = j.NextHref || '';
+    if (!next) break;
+  }
+  return {files: rows.filter(x => String(x.FSObjType) === '0')
     .map(x => ({path: x.FileRef, created: x['Created.'] || x.Created, modified: x['Modified.'] || x.Modified}))};
 }
 """
@@ -497,6 +521,23 @@ def _list_folder(page, folder_path: str, recursive: bool) -> list[dict]:
         raise RuntimeError(f"Could not list the folder ({res['error']}). "
                            "Check you can open it in the browser window.")
     return res["files"]
+
+
+def _when(v) -> float:
+    """Sortable timestamp from SharePoint's ISO dates ("2026-01-03T10:00:00Z"); unknown -> 0."""
+    from datetime import datetime
+
+    if not v:
+        return 0.0
+    s = str(v).strip().replace("Z", "+00:00")
+    for parse in (datetime.fromisoformat,
+                  lambda t: datetime.strptime(t, "%m/%d/%Y %I:%M %p"),
+                  lambda t: datetime.strptime(t, "%m/%d/%Y")):
+        try:
+            return parse(s).timestamp()
+        except ValueError:
+            continue
+    return 0.0
 
 
 def _natural(s: str):
