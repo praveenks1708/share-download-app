@@ -45,9 +45,9 @@ def download():
     if not urls or bad:
         return jsonify(error="Paste one or more https:// SharePoint links, one per line."), 400
     out_dir = str(Path(base).expanduser() / folder) if folder else base
-    jobs = dl.submit_batch(urls, out_dir, prefix)
-    return jsonify(ok=True, ids=[j.id for j in jobs], out_dir=out_dir,
-                   names=[j.filename for j in jobs])
+    sort = data.get("sort") if data.get("sort") in ("name", "created", "modified") else "name"
+    jobs = dl.submit_batch(urls, out_dir, prefix, recursive=bool(data.get("recursive")), sort=sort)
+    return jsonify(ok=True, ids=[j.id for j in jobs], out_dir=out_dir)
 
 
 def _clean_name(s) -> str:

@@ -40,9 +40,14 @@ http://127.0.0.1:8765. Set `PORT=` to change the port.
 
 ## Using it
 
-Paste links, optionally set a **Folder name** (created inside the base folder) and a **File name prefix**.
-Videos are saved as `<prefix>_1.mp4`, `<prefix>_2.mp4`, … (or `1.mp4`, `2.mp4`, …), continuing after the
-highest number already in that folder.
+Paste **video links or folder links**, one per line. Optionally set a **Folder name** (created inside the
+base folder) and a **File name prefix**. Videos are saved as `<prefix>_1.mp4`, `<prefix>_2.mp4`, … (or
+`1.mp4`, `2.mp4`, …) in download order, continuing after the highest number already in that folder.
+
+**Folder links** (a `/:f:/` sharing link, or a library / OneDrive folder URL with `?id=/sites/.../Folder`):
+the app lists every video in the folder and downloads them one by one, each through the same
+original-file / view-only-stream logic. Options: **Include subfolders**, and **Order** by name
+(natural: 1, 2, 10), date created or date modified. Non-video files are skipped.
 
 How it works:
 1. Each link opens in a real Chrome window with its own saved profile (`.browser-profile/`).

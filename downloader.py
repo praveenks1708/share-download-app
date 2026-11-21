@@ -42,7 +42,13 @@ LIST_DATA_CALLS = ("RenderListDataAsStream", "GetListDataAsStream")
 class Job:
     url: str
     out_dir: str
-    name: str = ""  # target file name without extension, e.g. "class_3"
+    prefix: str = ""  # file names become <prefix>_N (or N)
+    name: str = ""  # assigned when the download starts, e.g. "class_3"
+    kind: str = "video"  # video | folder
+    parent: str = ""  # folder job this video came from
+    source: str = ""  # original file name on SharePoint
+    recursive: bool = False  # folder links: include subfolders
+    sort: str = "name"  # folder links: name | created | modified
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     status: str = "queued"  # queued | running | waiting_login | done | error
     message: str = "Waiting in queue"
@@ -69,21 +75,26 @@ class Downloader:
         self._thread.start()
 
     # ---------- public API (any thread) ----------
-    def submit_batch(self, urls: list[str], out_dir: str, prefix: str = "") -> list[Job]:
-        """Queue URLs, naming them <prefix>_N (or N) in order, continuing after
-        the highest number already used in that folder."""
+    def submit_batch(self, urls: list[str], out_dir: str, prefix: str = "",
+                     recursive: bool = False, sort: str = "name") -> list[Job]:
+        """Queue video or folder links. Files are named <prefix>_N (or N) when
+        each download starts, continuing after the highest number in that folder,
+        so numbers follow download order (folder contents included)."""
+        jobs = [Job(url=u.strip(), out_dir=out_dir, prefix=prefix, recursive=recursive, sort=sort)
+                for u in urls]
         with self._lock:
-            n = self._next_number(out_dir, prefix)
-            jobs = []
-            for i, url in enumerate(urls):
-                name = f"{prefix}_{n + i}" if prefix else str(n + i)
-                job = Job(url=url.strip(), out_dir=out_dir, name=name, filename=name + ".mp4")
+            for job in jobs:
                 self.jobs[job.id] = job
                 self.order.append(job.id)
-                jobs.append(job)
         for job in jobs:
             self._q.put(("job", job))
         return jobs
+
+    def _assign_name(self, job: Job) -> str:
+        with self._lock:
+            n = self._next_number(job.out_dir, job.prefix)
+            job.name = f"{job.prefix}_{n}" if job.prefix else str(n)
+        return job.name
 
     def _next_number(self, out_dir: str, prefix: str) -> int:
         pat = re.compile(rf"^{re.escape(prefix + '_') if prefix else ''}(\d+)(\.[^.]+)*$", re.I)
@@ -91,7 +102,7 @@ class Downloader:
         d = Path(out_dir).expanduser()
         if d.is_dir():
             used += [int(m.group(1)) for f in d.iterdir() if (m := pat.match(f.name))]
-        # numbers reserved by jobs still queued or running for the same folder
+        # numbers taken by downloads still running for the same folder
         used += [int(m.group(1)) for j in self.jobs.values()
                  if j.out_dir == out_dir and j.status not in ("done", "error")
                  and (m := pat.match(j.name))]
@@ -101,7 +112,7 @@ class Downloader:
         self._q.put(("signin", url or "https://www.office.com/"))
 
     def list(self):
-        return [asdict(self.jobs[i]) for i in reversed(self.order)]
+        return [asdict(self.jobs[i]) for i in self.order]  # download order
 
     def clear_finished(self):
         self.order = [i for i in self.order if self.jobs[i].status not in ("done", "error")]
@@ -153,6 +164,7 @@ class Downloader:
 
         ctx = self._context()
         page = ctx.new_page()
+        children: list[Job] | None = None
         manifests: list[str] = []
         list_data: list = []  # responses carrying ListSchema[".videoManifestUrl"]
         page.on("request", lambda r: manifests.append(r.url) if "videomanifest" in r.url else None)
@@ -173,9 +185,9 @@ class Downloader:
                           f"?id={quote(unquote(parsed.path))}")
             page.goto(target, wait_until="domcontentloaded", timeout=60_000)
 
-            # Wait until we are on SharePoint (past any login) and know the file path.
+            # Wait until we are on SharePoint (past any login) and know the file/folder path.
             deadline = time.time() + SIGN_IN_TIMEOUT
-            file_path = None
+            file_path = folder_path = None
             while time.time() < deadline:
                 host = urlparse(page.url).netloc.lower()
                 if any(h in host for h in LOGIN_HOSTS):
@@ -184,9 +196,10 @@ class Downloader:
                     page.bring_to_front()
                 else:
                     if job.status == "waiting_login":
-                        job.update(status="running", message="Signed in, locating video…")
+                        job.update(status="running", message="Signed in, opening link…")
                     file_path = _file_path_from(page.url) or _file_path_from(job.url)
-                    if file_path or manifests:
+                    folder_path = _folder_path_from(page.url)
+                    if file_path or folder_path or manifests:
                         break
                 page.wait_for_timeout(1000)
             else:
@@ -194,13 +207,18 @@ class Downloader:
 
             pr = urlparse(page.url)
             origin = f"{pr.scheme}://{pr.netloc}"
-            if job.name:
-                ext = Path(file_path).suffix.lower() if file_path else ""
-                name = job.name + (ext if ext in VIDEO_EXT else ".mp4")
-            else:
-                name = Path(file_path).name if file_path else _safe(page.title() or "video") + ".mp4"
+
+            # Folder link: list its videos, then download them one by one (below).
+            if folder_path and not manifests:
+                children = self._expand_folder(job, page, origin, folder_path)
+                return
+            if not file_path and not manifests:
+                raise RuntimeError("This link is not a video or a folder.")
+
+            ext = Path(file_path).suffix.lower() if file_path else ""
+            name = self._assign_name(job) + (ext if ext in VIDEO_EXT else ".mp4")
             dest = _unique(out_dir / _safe(name))
-            job.update(filename=dest.name)
+            job.update(filename=dest.name, source=job.source or (Path(file_path).name if file_path else ""))
 
             # 1) Original file via SharePoint's download endpoint.
             if file_path:
@@ -229,6 +247,54 @@ class Downloader:
                 page.close()
             except Exception:  # noqa: BLE001
                 pass
+            if children is not None:
+                self._run_children(job, children)
+
+    # ---------- folders ----------
+    def _expand_folder(self, job: Job, page, origin: str, folder_path: str) -> list[Job]:
+        job.update(kind="folder", filename=Path(folder_path).name or folder_path,
+                   message="Listing videos in folder…")
+        files = _list_folder(page, folder_path, job.recursive)
+        videos = [f for f in files if f["path"].lower().endswith(VIDEO_EXT)]
+        key = {
+            "created": lambda f: (f.get("created") or "", _natural(f["path"])),
+            "modified": lambda f: (f.get("modified") or "", _natural(f["path"])),
+        }.get(job.sort, lambda f: _natural(f["path"]))
+        videos.sort(key=key)
+        if not videos:
+            raise RuntimeError(f"No videos found in this folder ({len(files)} other files)."
+                               + ("" if job.recursive else " Tick 'Include subfolders' to look deeper."))
+        children = []
+        with self._lock:
+            at = self.order.index(job.id) + 1
+            for f in videos:
+                site = _site_of(f["path"])
+                c = Job(url=f"{origin}{site}/_layouts/15/stream.aspx?id={quote(f['path'])}",
+                        out_dir=job.out_dir, prefix=job.prefix, parent=job.id,
+                        source=Path(f["path"]).name, filename=Path(f["path"]).name)
+                self.jobs[c.id] = c
+                children.append(c)
+            self.order[at:at] = [c.id for c in children]
+        job.update(message=f"Found {len(children)} videos; downloading one by one…", progress=0.0)
+        return children
+
+    def _run_children(self, job: Job, children: list[Job]):
+        ok = failed = 0
+        for i, c in enumerate(children):
+            job.update(message=f"Downloading {i + 1} of {len(children)}: {c.source}",
+                       progress=i / len(children))
+            try:
+                self._run(c)
+            except Exception as e:  # noqa: BLE001
+                traceback.print_exc()
+                c.update(status="error", message=_short(e))
+            if c.status == "done":
+                ok += 1
+            else:
+                failed += 1
+        job.update(status="done" if ok else "error", progress=1.0,
+                   message=f"{len(children)} videos: {ok} downloaded"
+                           + (f", {failed} failed" if failed else ""))
 
     def _manifest_candidates(self, page, file_path, manifests, list_data) -> list[str]:
         """Manifest URLs to try, best first.
@@ -366,6 +432,75 @@ def _file_path_from(url: str) -> str | None:
     if path.lower().endswith(VIDEO_EXT):
         return path
     return None
+
+
+def _folder_path_from(url: str) -> str | None:
+    """Server-relative folder path from a library/OneDrive folder view URL, else None."""
+    p = urlparse(url)
+    if "stream.aspx" in p.path.lower():
+        return None
+    qs = parse_qs(p.query)
+    for key in ("id", "RootFolder"):
+        if key in qs and qs[key][0].startswith("/"):
+            path = unquote(qs[key][0]).rstrip("/")
+            # A file previewed from a library view has id=<file>&parent=<folder>.
+            return None if path.lower().endswith(VIDEO_EXT) or "parent" in qs else path
+    path = unquote(p.path)
+    m = re.match(r"^(.*?)/Forms/[^/]+\.aspx$", path, re.I)  # library root view
+    return m.group(1) if m else None
+
+
+_LIST_JS = r"""
+async ({site, folder, recursive, listUrl}) => {
+  const H = {Accept: 'application/json;odata=nometadata'};
+  const q = s => encodeURIComponent(s.replace(/'/g, "''"));
+  const api = location.origin + site + '/_api/web';
+  async function rest(path) {
+    const base = `${api}/GetFolderByServerRelativePath(decodedurl='${q(path)}')`;
+    const r = await fetch(`${base}/Files?$select=ServerRelativeUrl,TimeCreated,TimeLastModified&$top=5000`, {headers: H});
+    if (!r.ok) throw new Error('REST ' + r.status);
+    let out = (await r.json()).value.map(f => ({path: f.ServerRelativeUrl, created: f.TimeCreated, modified: f.TimeLastModified}));
+    if (recursive) {
+      const d = await fetch(`${base}/Folders?$select=Name,ServerRelativeUrl&$top=5000`, {headers: H});
+      if (d.ok) for (const sub of (await d.json()).value)
+        if (sub.Name !== 'Forms') out = out.concat(await rest(sub.ServerRelativeUrl));
+    }
+    return out;
+  }
+  try { return {files: await rest(folder)}; } catch (e) { var restErr = String(e); }
+  // Fallback: the call the SharePoint UI itself uses (works for some sharing-link access).
+  const digest = (window._spPageContextInfo || {}).formDigestValue
+              || (document.getElementById('__REQUESTDIGEST') || {}).value || '';
+  const u = `${api}/GetList(@a1)/RenderListDataAsStream?@a1='${q(listUrl)}'&RootFolder=${encodeURIComponent(folder)}`;
+  const view = `<View${recursive ? ' Scope="RecursiveAll"' : ''}><ViewFields><FieldRef Name="FileRef"/>`
+             + `<FieldRef Name="FSObjType"/><FieldRef Name="Created"/><FieldRef Name="Modified"/></ViewFields>`
+             + `<RowLimit Paged="TRUE">5000</RowLimit></View>`;
+  const r = await fetch(u, {method: 'POST', body: JSON.stringify({parameters: {RenderOptions: 2, ViewXml: view}}),
+    headers: {...H, 'Content-Type': 'application/json;odata=nometadata', ...(digest ? {'X-RequestDigest': digest} : {})}});
+  if (!r.ok) return {error: `${restErr}; list ${r.status}`};
+  const j = await r.json();
+  return {files: (j.Row || []).filter(x => String(x.FSObjType) === '0')
+    .map(x => ({path: x.FileRef, created: x['Created.'] || x.Created, modified: x['Modified.'] || x.Modified}))};
+}
+"""
+
+
+def _list_folder(page, folder_path: str, recursive: bool) -> list[dict]:
+    """Files in a SharePoint folder, as [{path, created, modified}], via the signed-in page."""
+    site = _site_of(folder_path)
+    nsite = len([s for s in site.split("/") if s])
+    parts = folder_path.strip("/").split("/")
+    list_url = "/" + "/".join(parts[: nsite + 1])
+    res = page.evaluate(_LIST_JS, {"site": site, "folder": folder_path,
+                                   "recursive": recursive, "listUrl": list_url})
+    if res.get("error"):
+        raise RuntimeError(f"Could not list the folder ({res['error']}). "
+                           "Check you can open it in the browser window.")
+    return res["files"]
+
+
+def _natural(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
 def _site_of(file_path: str) -> str:
